@@ -24,12 +24,15 @@ public sealed class AssfontsRunner(string cacheRoot) : IAssfontsRunner
         var binary = await NativeBinary.ExtractAsync(cacheRoot, token);
         var attachedDirectory = Path.Combine(work, "attached-fonts");
         var attachedFonts = await AttachedFonts.ExtractAsync(input, attachedDirectory, token);
-        // Explicitly supplied attachments are searched before the cached directory database.
-        var database = await GetFontDatabaseAsync(binary, work, fontDirectory, token);
-        await File.WriteAllBytesAsync(Path.Combine(work, "fonts.json"), database, token);
-        var arguments = new List<string>();
-        if (attachedFonts > 0) arguments.AddRange(new[] { "-f", attachedDirectory });
-        arguments.AddRange(new[] { "-d", work, "-o", work, "-m", "1", "-i", input });
+        var database = JsonNode.Parse(await GetFontDatabaseAsync(binary, work, fontDirectory, token))!.AsArray();
+        if (attachedFonts > 0)
+        {
+            var attachments = await BuildFontDatabaseAsync(binary, Path.Combine(work, "attachment-index"),
+                FontDirectorySnapshot.Capture(attachedDirectory), token);
+            PrioritizeAttachments(database, attachments);
+        }
+        await File.WriteAllTextAsync(Path.Combine(work, "fonts.json"), database.ToJsonString(), token);
+        var arguments = new[] { "-d", work, "-o", work, "-m", "1", "-i", input };
         var result = await ExecuteAsync(binary, work, arguments, token);
         var output = Path.Combine(work, Path.GetFileNameWithoutExtension(input) + ".assfonts" + Path.GetExtension(input));
         return new RunResult(result.Success && File.Exists(output), output, result.Detail);
@@ -67,25 +70,10 @@ public sealed class AssfontsRunner(string cacheRoot) : IAssfontsRunner
             // Rebuild from an empty database so removed files cannot remain in the index.
             if (Directory.Exists(directory)) Directory.Delete(directory, true);
             var build = Path.Combine(work, "font-index");
-            Directory.CreateDirectory(build);
-            var builtDatabase = Path.Combine(build, "fonts.json");
-            await File.WriteAllTextAsync(builtDatabase, "[]", token);
-            var indexed = await ExecuteAsync(binary, build, new[] { "-b", "-f", snapshot.Directory, "-d", build }, token);
-            if (!indexed.Success) throw new IOException("Could not build font database: " + indexed.Detail);
-            var entries = JsonNode.Parse(await File.ReadAllTextAsync(builtDatabase, token))!.AsArray();
-            var comparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
-            var allowed = snapshot.Files.ToDictionary(file => PathKey(file.Path), file => file.ResolvedPath, comparer);
-            for (var i = entries.Count - 1; i >= 0; i--)
-            {
-                var entry = entries[i]!;
-                var path = entry["path"]!.GetValue<string>();
-                // assfonts -b also scans system fonts; retain only the configured directory.
-                if (!allowed.TryGetValue(PathKey(path), out var resolved)) { entries.RemoveAt(i); continue; }
-                // assfonts 0.7.3 sizes Windows symlinks instead of their targets during subsetting.
-                entry["path"] = resolved;
-            }
+            var entries = await BuildFontDatabaseAsync(binary, build, snapshot, token);
             if (snapshot.Fingerprint != FontDirectorySnapshot.Capture(configured).Fingerprint)
                 throw new IOException("Fonts changed while building the font database.");
+            var builtDatabase = Path.Combine(build, "fonts.json");
             var bytes = Encoding.UTF8.GetBytes(entries.ToJsonString());
             await File.WriteAllBytesAsync(builtDatabase, bytes, token);
             var stateFile = Path.Combine(build, "state.json");
@@ -98,6 +86,45 @@ public sealed class AssfontsRunner(string cacheRoot) : IAssfontsRunner
             return bytes;
         }
         finally { indexGate.Release(); }
+    }
+
+    private static async Task<JsonArray> BuildFontDatabaseAsync(string binary, string build,
+        FontDirectorySnapshot snapshot, CancellationToken token)
+    {
+        Directory.CreateDirectory(build);
+        var builtDatabase = Path.Combine(build, "fonts.json");
+        await File.WriteAllTextAsync(builtDatabase, "[]", token);
+        var indexed = await ExecuteAsync(binary, build, new[] { "-b", "-f", snapshot.Directory, "-d", build }, token);
+        if (!indexed.Success) throw new IOException("Could not build font database: " + indexed.Detail);
+        var entries = JsonNode.Parse(await File.ReadAllTextAsync(builtDatabase, token))!.AsArray();
+        var comparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+        var allowed = snapshot.Files.ToDictionary(file => PathKey(file.Path), file => file.ResolvedPath, comparer);
+        for (var i = entries.Count - 1; i >= 0; i--)
+        {
+            var entry = entries[i]!;
+            var path = entry["path"]!.GetValue<string>();
+            // assfonts -b also scans system fonts; retain only the configured directory.
+            if (!allowed.TryGetValue(PathKey(path), out var resolved)) { entries.RemoveAt(i); continue; }
+            // assfonts 0.7.3 sizes Windows symlinks instead of their targets during subsetting.
+            entry["path"] = resolved;
+        }
+        return entries;
+    }
+
+    private static readonly string[] NameFields = ["families", "fullnames", "psnames"];
+
+    private static void PrioritizeAttachments(JsonArray database, JsonArray attachments)
+    {
+        var names = attachments.SelectMany(entry => NameFields.SelectMany(field => entry![field]!.AsArray()))
+            .Select(name => name!.GetValue<string>()).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var entry in database)
+            foreach (var field in NameFields)
+            {
+                var aliases = entry![field]!.AsArray();
+                for (var i = aliases.Count - 1; i >= 0; i--)
+                    if (names.Contains(aliases[i]!.GetValue<string>())) aliases.RemoveAt(i);
+            }
+        foreach (var entry in attachments) database.Add(entry!.DeepClone());
     }
 
     private static string PathKey(string path)

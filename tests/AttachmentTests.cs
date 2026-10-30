@@ -108,6 +108,47 @@ public sealed class AttachmentTests : IDisposable
         Assert.Empty(Directory.GetDirectories(Path.Combine(root, "cache/jobs")));
     }
 
+    [Fact]
+    public async Task AttachmentDatabaseIsPerSubtitleAndNeverLeaksIntoDirectoryCache()
+    {
+        var fonts = Path.Combine(root, "fonts"); Directory.CreateDirectory(fonts);
+        var local = Path.Combine(fonts, "local.ttf");
+        File.Copy(Path.Combine(AppContext.BaseDirectory, "Fixtures/local-font.ttf"), local);
+        var cacheRoot = Path.Combine(root, "cache");
+        var runner = new InspectingRunner(new AssfontsRunner(cacheRoot));
+        using var processor = new SubtitleProcessor(cacheRoot, () => fonts, runner, NullLogger<SubtitleProcessor>.Instance);
+        var mixed = Subtitle.Replace("가나다 ABC", @"가나다 {\fnLocalFont Test}ABC");
+        using var source = new MemoryStream(Encoding.UTF8.GetBytes(WithFont(mixed, Font, "attached.ttf")));
+        await using var result = await processor.TransformAsync(source, "ass", default);
+        Assert.NotNull(result);
+        Assert.True(runner.AttachmentIndexExisted);
+        Assert.Equal(2, runner.IndexedPaths.Length);
+        Assert.Contains(local, runner.IndexedPaths);
+        var permanent = File.ReadAllText(Path.Combine(cacheRoot, "font-index", "fonts.json"));
+        Assert.DoesNotContain("font-0000", permanent);
+        Assert.Empty(Directory.GetDirectories(Path.Combine(cacheRoot, "jobs")));
+
+        using var localSource = new MemoryStream(Encoding.UTF8.GetBytes(Subtitle.Replace("AssFonts Test", "LocalFont Test").Replace("가나다 ABC", "ABC")));
+        await using var localResult = await processor.TransformAsync(localSource, "ass", default);
+        Assert.NotNull(localResult);
+        Assert.False(runner.AttachmentIndexExisted);
+        Assert.Equal(new[] { local }, runner.IndexedPaths);
+    }
+
+    private sealed class InspectingRunner(IAssfontsRunner inner) : IAssfontsRunner
+    {
+        public bool AttachmentIndexExisted { get; private set; }
+        public string[] IndexedPaths { get; private set; } = [];
+        public async Task<RunResult> RunAsync(string input, string work, string fontDirectory, CancellationToken token)
+        {
+            var result = await inner.RunAsync(input, work, fontDirectory, token);
+            AttachmentIndexExisted = File.Exists(Path.Combine(work, "attachment-index", "fonts.json"));
+            IndexedPaths = System.Text.Json.Nodes.JsonNode.Parse(await File.ReadAllTextAsync(Path.Combine(work, "fonts.json"), token))!.AsArray()
+                .Select(entry => entry!["path"]!.GetValue<string>()).Distinct().ToArray();
+            return result;
+        }
+    }
+
     [Theory]
     [InlineData(0)]
     [InlineData(1)]
