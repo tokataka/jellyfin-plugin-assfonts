@@ -42,31 +42,62 @@ internal static class AssfontsNative
     internal static async Task<(bool Success, string Detail)> ExecuteAsync(string binary, string work,
         IEnumerable<string> arguments, CancellationToken token)
     {
+        var args = arguments.ToArray();
+        for (var attempt = 0; ; attempt++)
+        {
+            token.ThrowIfCancellationRequested();
+            var result = await ExecuteAttemptAsync(binary, work, args, token);
+            if (result.ShutdownStalled && attempt == 0) continue;
+            var detail = attempt > 0 ? "Retried assfonts after a shutdown stall.\n" + result.Detail : result.Detail;
+            return (result.Success, detail);
+        }
+    }
+
+    private static async Task<(bool Success, string Detail, bool ShutdownStalled)> ExecuteAttemptAsync(
+        string binary, string work, IEnumerable<string> arguments, CancellationToken token)
+    {
         var info = new ProcessStartInfo(binary)
         {
             WorkingDirectory = work, UseShellExecute = false, CreateNoWindow = true,
             RedirectStandardOutput = true, RedirectStandardError = true
         };
-        foreach (var argument in arguments)
-            info.ArgumentList.Add(argument);
+        foreach (var argument in arguments) info.ArgumentList.Add(argument);
         using var process = Process.Start(info) ?? throw new IOException("Could not start assfonts.");
-        var stdout = CaptureAsync(process.StandardOutput);
-        var stderr = CaptureAsync(process.StandardError);
-        try { await process.WaitForExitAsync(token); }
-        catch (OperationCanceledException)
+        var completed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var stdout = CaptureAsync(process.StandardOutput, completed);
+        var stderr = CaptureAsync(process.StandardError, completed);
+        var stalled = false;
+        async Task StopAsync()
         {
             try { if (!process.HasExited) process.Kill(entireProcessTree: true); }
             catch (InvalidOperationException) { }
             await process.WaitForExitAsync(CancellationToken.None);
             await Task.WhenAll(stdout, stderr);
-            throw;
         }
+        try
+        {
+            var exit = process.WaitForExitAsync(token);
+            if (await Task.WhenAny(exit, completed.Task) == completed.Task)
+            {
+                // assfonts 0.7.3 can lose the log queue's final wake-up. Only watch for
+                // shutdown after a terminal message, never while normal subsetting runs.
+                if (await Task.WhenAny(exit, Task.Delay(TimeSpan.FromSeconds(1), token)) != exit)
+                {
+                    token.ThrowIfCancellationRequested();
+                    stalled = true;
+                    await StopAsync();
+                }
+            }
+            await exit;
+        }
+        catch (OperationCanceledException) { await StopAsync(); throw; }
         var logs = await Task.WhenAll(stdout, stderr);
-        return (process.ExitCode == 0 && !logs.Any(l => l.Bad),
-            $"assfonts exit code: {process.ExitCode}\n" + string.Join("\n", logs.Select(l => l.Text)));
+        return (!stalled && process.ExitCode == 0 && !logs.Any(l => l.Bad),
+            $"assfonts exit code: {process.ExitCode}\n" + (stalled ? "assfonts did not exit after its terminal log message.\n" : "")
+            + string.Join("\n", logs.Select(l => l.Text)), stalled);
     }
 
-    private static async Task<(bool Bad, string Text)> CaptureAsync(StreamReader reader)
+    private static async Task<(bool Bad, string Text)> CaptureAsync(StreamReader reader, TaskCompletionSource completed)
     {
         var text = new StringBuilder();
         var buffer = new char[4096];
@@ -78,7 +109,10 @@ internal static class AssfontsNative
             var chunk = tail + new string(buffer, 0, count);
             bad |= chunk.Contains("[ERROR]", StringComparison.Ordinal)
                 || chunk.Contains("Missing codepoints", StringComparison.Ordinal);
-            tail = chunk[^Math.Min(32, chunk.Length)..];
+            if (chunk.Contains("[INFO] Create font-embeded subtitle:", StringComparison.Ordinal)
+                || chunk.Contains("[INFO] Fonts database has been saved in", StringComparison.Ordinal)
+                || chunk.Contains("[ERROR]", StringComparison.Ordinal)) completed.TrySetResult();
+            tail = chunk[^Math.Min(128, chunk.Length)..];
             if (text.Length < 65536) text.Append(buffer, 0, Math.Min(count, 65536 - text.Length));
         }
         return (bad, text.ToString());

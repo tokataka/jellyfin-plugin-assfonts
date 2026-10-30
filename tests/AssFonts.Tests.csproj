@@ -1,6 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup><IsTestProject>true</IsTestProject><IsPackable>false</IsPackable></PropertyGroup>
   <ItemGroup>
+    <Compile Remove="NativeProcessFixture/**/*.cs" />
+    <ProjectReference Include="NativeProcessFixture/NativeProcessFixture.csproj" ReferenceOutputAssembly="false" />
     <ProjectReference Include="../src/Jellyfin.Plugin.AssFonts.csproj" />
     <PackageReference Include="Jellyfin.Controller" Version="12.4.0" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
@@ -8,4 +10,8 @@
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" PrivateAssets="all" />
     <None Update="Fixtures/**" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
+  <Target Name="CopyNativeProcessFixture" AfterTargets="Build">
+    <ItemGroup><NativeProcessFixtureFiles Include="NativeProcessFixture/bin/$(Configuration)/$(TargetFramework)/*" /></ItemGroup>
+    <Copy SourceFiles="@(NativeProcessFixtureFiles)" DestinationFolder="$(OutDir)NativeProcessFixture" />
+  </Target>
 </Project>
