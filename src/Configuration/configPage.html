@@ -10,6 +10,11 @@
         <input id="AssFontsDirectory" type="text" is="emby-input" autocomplete="off" />
         <div class="fieldDescription">Absolute path on the Jellyfin server. Searches subfolders for TTF, TTC, OTF and OTC fonts.</div>
       </div>
+      <div class="inputContainer">
+        <label class="inputLabel inputLabelUnfocused" for="AssFontsFallback">Fallback font</label>
+        <input id="AssFontsFallback" type="text" is="emby-input" autocomplete="off" />
+        <div class="fieldDescription">Optional absolute font file path. Used when a requested font is unavailable. Font collections use the first face.</div>
+      </div>
       <p>Embeds subset fonts into ASS/SSA subtitles and caches the generated subtitles.</p>
       <button is="emby-button" type="submit" class="raised button-submit block emby-button"><span>Save</span></button>
     </form>
@@ -19,11 +24,13 @@
       var id = 'cb963c2d-9d76-48b1-9f90-5c0cd5b25eae';
       var page = document.querySelector('#AssFontsConfigPage');
       var input = page.querySelector('#AssFontsDirectory');
+      var fallback = page.querySelector('#AssFontsFallback');
       function failed() { Dashboard.hideLoadingMsg(); Dashboard.alert('Unable to load or save settings. Please try again.'); }
       page.addEventListener('pageshow', function () {
         Dashboard.showLoadingMsg();
         ApiClient.getPluginConfiguration(id).then(function (config) {
           input.value = config.FontDirectory || '';
+          fallback.value = config.FallbackFont || '';
           Dashboard.hideLoadingMsg();
         }).catch(failed);
       });
@@ -31,6 +38,7 @@
         event.preventDefault(); Dashboard.showLoadingMsg();
         ApiClient.getPluginConfiguration(id).then(function (config) {
           config.FontDirectory = input.value.trim();
+          config.FallbackFont = fallback.value.trim();
           return ApiClient.updatePluginConfiguration(id, config);
         }).then(function (result) { Dashboard.processPluginConfigurationUpdateResult(result); }).catch(failed);
       });

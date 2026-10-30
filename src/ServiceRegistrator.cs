@@ -15,7 +15,8 @@ public sealed class ServiceRegistrator : IPluginServiceRegistrator
         {
             var root = Path.Combine(provider.GetRequiredService<IApplicationPaths>().CachePath, "assfonts");
             return new SubtitleProcessor(root, () => Plugin.Instance?.Configuration.FontDirectory ?? string.Empty,
-                new AssfontsRunner(root), provider.GetRequiredService<ILogger<SubtitleProcessor>>());
+                new AssfontsRunner(root), provider.GetRequiredService<ILogger<SubtitleProcessor>>(),
+                () => Plugin.Instance?.Configuration.FallbackFont ?? string.Empty);
         });
         services.AddTransient<SubtitleResultFilter>();
         services.Configure<MvcOptions>(options => options.Filters.AddService<SubtitleResultFilter>());

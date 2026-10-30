@@ -8,6 +8,7 @@ namespace Jellyfin.Plugin.AssFonts;
 public sealed class PluginConfiguration : BasePluginConfiguration
 {
     public string FontDirectory { get; set; } = string.Empty;
+    public string FallbackFont { get; set; } = string.Empty;
 }
 
 public sealed class Plugin : BasePlugin<PluginConfiguration>, IHasWebPages

@@ -13,6 +13,7 @@ https://raw.githubusercontent.com/tokataka/jellyfin-plugin-repository/main/manif
 Install **ASS Fonts** from the catalog and restart Jellyfin.
 
 Set the font directory on the plugin's configuration page.
+Optionally set a fallback font file for missing fonts.
 
 ## Requirements
 

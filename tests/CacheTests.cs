@@ -324,14 +324,14 @@ public sealed class CacheTests : IDisposable
     {
         private int calls;
         public int Calls=>calls;
-        public Task<RunResult> RunAsync(string input,string work,string fontDirectory,CancellationToken token)
-        { Interlocked.Increment(ref calls); return inner.RunAsync(input,work,fontDirectory,token); }
+        public Task<RunResult> RunAsync(string input,string work,string fontDirectory,CancellationToken token, string fallbackFont = "")
+        { Interlocked.Increment(ref calls); return inner.RunAsync(input,work,fontDirectory,token,fallbackFont); }
     }
 
     private sealed class FailedRunner(string failure) : IAssfontsRunner
     {
         public int Calls { get; private set; }
-        public async Task<RunResult> RunAsync(string input,string work,string fontDirectory,CancellationToken token)
+        public async Task<RunResult> RunAsync(string input,string work,string fontDirectory,CancellationToken token, string fallbackFont = "")
         {
             Calls++;
             if(failure=="timeout") await Task.Delay(Timeout.Infinite,token);
@@ -357,7 +357,7 @@ public sealed class CacheTests : IDisposable
     {
         public TaskCompletionSource Entered { get; }=new(TaskCreationOptions.RunContinuationsAsynchronously);
         public TaskCompletionSource Release { get; }=new(TaskCreationOptions.RunContinuationsAsynchronously);
-        public async Task<RunResult> RunAsync(string input,string work,string fontDirectory,CancellationToken token)
-        { Entered.TrySetResult();await Release.Task.WaitAsync(token);return await inner.RunAsync(input,work,fontDirectory,token); }
+        public async Task<RunResult> RunAsync(string input,string work,string fontDirectory,CancellationToken token, string fallbackFont = "")
+        { Entered.TrySetResult();await Release.Task.WaitAsync(token);return await inner.RunAsync(input,work,fontDirectory,token,fallbackFont); }
     }
 }

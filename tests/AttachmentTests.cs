@@ -139,9 +139,9 @@ public sealed class AttachmentTests : IDisposable
     {
         public bool AttachmentIndexExisted { get; private set; }
         public string[] IndexedPaths { get; private set; } = [];
-        public async Task<RunResult> RunAsync(string input, string work, string fontDirectory, CancellationToken token)
+        public async Task<RunResult> RunAsync(string input, string work, string fontDirectory, CancellationToken token, string fallbackFont = "")
         {
-            var result = await inner.RunAsync(input, work, fontDirectory, token);
+            var result = await inner.RunAsync(input, work, fontDirectory, token, fallbackFont);
             AttachmentIndexExisted = File.Exists(Path.Combine(work, "attachment-index", "fonts.json"));
             IndexedPaths = System.Text.Json.Nodes.JsonNode.Parse(await File.ReadAllTextAsync(Path.Combine(work, "fonts.json"), token))!.AsArray()
                 .Select(entry => entry!["path"]!.GetValue<string>()).Distinct().ToArray();
