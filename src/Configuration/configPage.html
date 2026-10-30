@@ -17,6 +17,11 @@
       </div>
       <p>Embeds subset fonts into ASS/SSA subtitles and caches the generated subtitles.</p>
       <button is="emby-button" type="submit" class="raised button-submit block emby-button"><span>Save</span></button>
+      <div class="inputContainer" style="margin-top: 2em">
+        <button id="AssFontsRebuild" is="emby-button" type="button" class="raised emby-button"><span>Rebuild font database</span></button>
+        <div class="fieldDescription">Rebuilt on startup and when settings are saved. Rebuild after adding, removing or replacing font files.</div>
+        <p id="AssFontsDatabaseStatus" role="status"></p>
+      </div>
     </form>
   </div></div>
   <script>
@@ -25,6 +30,16 @@
       var page = document.querySelector('#AssFontsConfigPage');
       var input = page.querySelector('#AssFontsDirectory');
       var fallback = page.querySelector('#AssFontsFallback');
+      var rebuild = page.querySelector('#AssFontsRebuild');
+      var status = page.querySelector('#AssFontsDatabaseStatus');
+      var timer;
+      function showStatus(value) {
+        status.textContent = value.IsRebuilding ? 'Rebuilding font database…' : value.LastError ? 'Font database rebuild failed. Check the server log.' :
+          value.LastBuiltUtc ? 'Last built: ' + new Date(value.LastBuiltUtc).toLocaleString() + ' (' + value.FontCount + ' fonts)' : 'Font database has not been built yet.';
+      }
+      function refreshStatus() {
+        return ApiClient.ajax({ type: 'GET', url: ApiClient.getUrl('AssFonts/FontDatabase'), dataType: 'json' }).then(showStatus);
+      }
       function failed() { Dashboard.hideLoadingMsg(); Dashboard.alert('Unable to load or save settings. Please try again.'); }
       page.addEventListener('pageshow', function () {
         Dashboard.showLoadingMsg();
@@ -32,7 +47,18 @@
           input.value = config.FontDirectory || '';
           fallback.value = config.FallbackFont || '';
           Dashboard.hideLoadingMsg();
+          refreshStatus().catch(function () { status.textContent = 'Unable to load font database status.'; });
         }).catch(failed);
+        clearInterval(timer);
+        timer = setInterval(function () { refreshStatus().catch(function () {}); }, 3000);
+      });
+      page.addEventListener('pagehide', function () { clearInterval(timer); });
+      rebuild.addEventListener('click', function () {
+        rebuild.disabled = true;
+        status.textContent = 'Rebuilding font database…';
+        ApiClient.ajax({ type: 'POST', url: ApiClient.getUrl('AssFonts/FontDatabase/Rebuild'), dataType: 'json' })
+          .then(showStatus).catch(function () { status.textContent = 'Font database rebuild failed. Check the server log.'; })
+          .finally(function () { rebuild.disabled = false; });
       });
       page.querySelector('form').addEventListener('submit', function (event) {
         event.preventDefault(); Dashboard.showLoadingMsg();
