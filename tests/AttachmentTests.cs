@@ -36,6 +36,45 @@ public sealed class AttachmentTests : IDisposable
         Assert.Empty(Directory.GetFiles(fonts));
     }
 
+    [Theory]
+    [InlineData("")]
+    [InlineData("missing")]
+    [InlineData("relative")]
+    [InlineData("file")]
+    public async Task UsesAttachmentsWhenFontDirectoryIsUnavailable(string setting)
+    {
+        Directory.CreateDirectory(root);
+        var directory = setting switch
+        {
+            "missing" => Path.Combine(root, "missing"),
+            "relative" => "relative-font-directory",
+            "file" => Path.Combine(root, "not-a-directory"),
+            _ => ""
+        };
+        if (setting == "file") File.WriteAllText(directory, "not a directory");
+        using var processor = CreateCache(directory);
+        var input = WithFont(Subtitle, Font, "attached.ttf");
+        using var source = new MemoryStream(Encoding.UTF8.GetBytes(input));
+        await using var result = await processor.TransformAsync(source, "ass", default);
+        Assert.NotNull(result);
+        Assert.Contains("fontname:", await new StreamReader(result).ReadToEndAsync());
+        Assert.Equal(input, Encoding.UTF8.GetString(source.ToArray()));
+    }
+
+    [Fact]
+    public async Task AttachedFontTakesPriorityOverSameFamilyInConfiguredDirectory()
+    {
+        var fonts = Path.Combine(root, "fonts"); Directory.CreateDirectory(fonts);
+        File.WriteAllBytes(Path.Combine(fonts, "external.ttf"), Font);
+        using var processor = CreateCache(fonts);
+        using var source = new MemoryStream(Encoding.UTF8.GetBytes(WithFont(Subtitle, Font, "attached.ttf")));
+        await using var result = await processor.TransformAsync(source, "ass", default);
+        Assert.NotNull(result);
+        var text = await new StreamReader(result).ReadToEndAsync();
+        Assert.Contains("fontname: font-0000[", text);
+        Assert.DoesNotContain("fontname: external[", text);
+    }
+
     [Fact]
     public async Task MalformedAttachmentReturnsOriginalAndRemovesTemporaryFonts()
     {

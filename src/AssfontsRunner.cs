@@ -1,5 +1,7 @@
 using System.Diagnostics;
 using System.Text;
+using System.Security.Cryptography;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 
 namespace Jellyfin.Plugin.AssFonts;
@@ -14,42 +16,93 @@ public interface IAssfontsRunner
 public sealed class AssfontsRunner(string cacheRoot) : IAssfontsRunner
 {
     public static string BinarySha256 => NativeBinary.Current.Checksum;
+    private readonly SemaphoreSlim indexGate = new(1, 1);
+    private sealed record FontIndexState(string Fingerprint, string Checksum);
 
     public async Task<RunResult> RunAsync(string input, string work, string fontDirectory, CancellationToken token)
     {
         var binary = await NativeBinary.ExtractAsync(cacheRoot, token);
         var attachedDirectory = Path.Combine(work, "attached-fonts");
         var attachedFonts = await AttachedFonts.ExtractAsync(input, attachedDirectory, token);
-        // Search configured fonts and the subtitle's own attachments.
-        var database = Path.Combine(work, "fonts.json");
-        await File.WriteAllTextAsync(database, "[]", token);
-        var fonts = new List<string> { fontDirectory };
-        if (attachedFonts > 0) fonts.Add(attachedDirectory);
-        var arguments = new List<string> { "-f" };
-        arguments.AddRange(fonts);
-        if (OperatingSystem.IsWindows() && SubtitleProcessor.EnumerateFonts(fontDirectory).Any(path => new FileInfo(path).LinkTarget is not null))
-        {
-            // assfonts 0.7.3 sizes Windows symlinks instead of their targets during subsetting.
-            // Build its index first, then supply resolved paths without copying the font pool.
-            var indexed = await ExecuteAsync(binary, work, arguments.Concat(new[] { "-b", "-d", work }), token);
-            if (!indexed.Success) return new RunResult(false, "", indexed.Detail);
-            var allowed = fonts.SelectMany(SubtitleProcessor.EnumerateFonts).Select(path => WindowsPathKey(Path.GetFullPath(path))).ToHashSet(StringComparer.OrdinalIgnoreCase);
-            var entries = JsonNode.Parse(await File.ReadAllTextAsync(database, token))!.AsArray();
-            for (var i = entries.Count - 1; i >= 0; i--)
-            {
-                var entry = entries[i]!;
-                var path = Path.GetFullPath(entry["path"]!.GetValue<string>());
-                // The build command also scans system fonts; only retain configured/attached files.
-                if (!allowed.Contains(WindowsPathKey(path))) { entries.RemoveAt(i); continue; }
-                entry["path"] = new FileInfo(path).ResolveLinkTarget(true)?.FullName ?? path;
-            }
-            await File.WriteAllTextAsync(database, entries.ToJsonString(), token);
-            arguments.Clear();
-        }
+        // Explicitly supplied attachments are searched before the cached directory database.
+        var database = await GetFontDatabaseAsync(binary, work, fontDirectory, token);
+        await File.WriteAllBytesAsync(Path.Combine(work, "fonts.json"), database, token);
+        var arguments = new List<string>();
+        if (attachedFonts > 0) arguments.AddRange(new[] { "-f", attachedDirectory });
         arguments.AddRange(new[] { "-d", work, "-o", work, "-m", "1", "-i", input });
         var result = await ExecuteAsync(binary, work, arguments, token);
         var output = Path.Combine(work, Path.GetFileNameWithoutExtension(input) + ".assfonts" + Path.GetExtension(input));
         return new RunResult(result.Success && File.Exists(output), output, result.Detail);
+    }
+
+    private async Task<byte[]> GetFontDatabaseAsync(string binary, string work, string configured, CancellationToken token)
+    {
+        await indexGate.WaitAsync(token);
+        try
+        {
+            var snapshot = FontDirectorySnapshot.Capture(configured);
+            var directory = Path.Combine(cacheRoot, "font-index");
+            if (snapshot.Files.Count == 0)
+            {
+                if (Directory.Exists(directory)) Directory.Delete(directory, true);
+                return "[]"u8.ToArray();
+            }
+            var fingerprint = BinarySha256 + ":" + snapshot.Fingerprint;
+            var database = Path.Combine(directory, "fonts.json");
+            var statePath = Path.Combine(directory, "state.json");
+            try
+            {
+                if (File.Exists(database) && File.Exists(statePath))
+                {
+                    var state = JsonSerializer.Deserialize<FontIndexState>(await File.ReadAllTextAsync(statePath, token));
+                    if (state?.Fingerprint == fingerprint)
+                    {
+                        var saved = await File.ReadAllBytesAsync(database, token);
+                        if (Convert.ToHexStringLower(SHA256.HashData(saved)) == state.Checksum) return saved;
+                    }
+                }
+            }
+            catch (Exception exception) when (exception is IOException or JsonException) { }
+
+            // Rebuild from an empty database so removed files cannot remain in the index.
+            if (Directory.Exists(directory)) Directory.Delete(directory, true);
+            var build = Path.Combine(work, "font-index");
+            Directory.CreateDirectory(build);
+            var builtDatabase = Path.Combine(build, "fonts.json");
+            await File.WriteAllTextAsync(builtDatabase, "[]", token);
+            var indexed = await ExecuteAsync(binary, build, new[] { "-b", "-f", snapshot.Directory, "-d", build }, token);
+            if (!indexed.Success) throw new IOException("Could not build font database: " + indexed.Detail);
+            var entries = JsonNode.Parse(await File.ReadAllTextAsync(builtDatabase, token))!.AsArray();
+            var comparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+            var allowed = snapshot.Files.ToDictionary(file => PathKey(file.Path), file => file.ResolvedPath, comparer);
+            for (var i = entries.Count - 1; i >= 0; i--)
+            {
+                var entry = entries[i]!;
+                var path = entry["path"]!.GetValue<string>();
+                // assfonts -b also scans system fonts; retain only the configured directory.
+                if (!allowed.TryGetValue(PathKey(path), out var resolved)) { entries.RemoveAt(i); continue; }
+                // assfonts 0.7.3 sizes Windows symlinks instead of their targets during subsetting.
+                entry["path"] = resolved;
+            }
+            if (snapshot.Fingerprint != FontDirectorySnapshot.Capture(configured).Fingerprint)
+                throw new IOException("Fonts changed while building the font database.");
+            var bytes = Encoding.UTF8.GetBytes(entries.ToJsonString());
+            await File.WriteAllBytesAsync(builtDatabase, bytes, token);
+            var stateFile = Path.Combine(build, "state.json");
+            await File.WriteAllTextAsync(stateFile,
+                JsonSerializer.Serialize(new FontIndexState(fingerprint, Convert.ToHexStringLower(SHA256.HashData(bytes)))), token);
+            Directory.CreateDirectory(directory);
+            File.Move(builtDatabase, database, true);
+            File.Move(stateFile, statePath, true);
+            return bytes;
+        }
+        finally { indexGate.Release(); }
+    }
+
+    private static string PathKey(string path)
+    {
+        var full = Path.GetFullPath(path);
+        return OperatingSystem.IsWindows() ? WindowsPathKey(full) : full;
     }
 
     private static string WindowsPathKey(string path) =>

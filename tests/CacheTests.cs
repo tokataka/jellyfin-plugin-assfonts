@@ -83,6 +83,112 @@ public sealed class CacheTests : IDisposable
     }
 
     [Fact]
+    public async Task ReusesFontDatabaseAndRebuildsForAddedRemovedOrRelocatedFonts()
+    {
+        var database = Path.Combine(root, "cache", "font-index", "fonts.json");
+        async Task<bool> Generate(byte[] data, SubtitleProcessor? processor = null)
+        {
+            using var source = new MemoryStream(data);
+            await using var result = await (processor ?? cache).TransformAsync(source, "ass", default);
+            return result is not null;
+        }
+        string[] IndexedPaths() => System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(database))!.AsArray()
+            .Select(entry => entry!["path"]!.GetValue<string>()).Distinct().ToArray();
+        Assert.True(await Generate(input));
+        Assert.True(File.Exists(database));
+        Assert.Equal(Directory.GetFiles(fonts), IndexedPaths());
+        var markerTime = new DateTime(2001, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+        File.SetLastWriteTimeUtc(database, markerTime);
+        Assert.True(await Generate(Encoding.UTF8.GetBytes(Encoding.UTF8.GetString(input).Replace("ABC", "AB"))));
+        Assert.Equal(markerTime, File.GetLastWriteTimeUtc(database));
+        var added = Path.Combine(fonts, "local.ttf");
+        File.Copy(Path.Combine(AppContext.BaseDirectory, "Fixtures/local-font.ttf"), added);
+        Assert.True(await Generate(input));
+        Assert.Contains(added, IndexedPaths());
+        File.Delete(added);
+        Assert.True(await Generate(input));
+        Assert.DoesNotContain(added, IndexedPaths());
+        var moved = Path.Combine(root, "moved-fonts");
+        Directory.Move(fonts, moved);
+        using var relocated = new SubtitleProcessor(Path.Combine(root, "cache"), () => moved, runner, logger);
+        Assert.True(await Generate(input, relocated));
+        Assert.Equal(Directory.GetFiles(moved), IndexedPaths());
+    }
+
+    [Fact]
+    public async Task MissingDirectoryDiscardsFontDatabaseButStillProcessesAttachments()
+    {
+        var font = File.ReadAllBytes(Directory.GetFiles(fonts)[0]);
+        using var first = new MemoryStream(input);
+        await using var initial = await cache.TransformAsync(first, "ass", default);
+        Assert.NotNull(initial);
+        var database = Path.Combine(root, "cache", "font-index", "fonts.json");
+        Assert.True(File.Exists(database));
+        Directory.Delete(fonts, true);
+        var attached = AttachmentTests.WithFont(Encoding.UTF8.GetString(input), font, "attached.ttf");
+        using var source = new MemoryStream(Encoding.UTF8.GetBytes(attached));
+        await using var result = await cache.TransformAsync(source, "ass", default);
+        Assert.NotNull(result);
+        Assert.False(File.Exists(database));
+    }
+
+    [Fact]
+    public async Task QueuedRequestUsesTheLatestConfiguredDirectory()
+    {
+        var location = Path.Combine(root, "switching");
+        var configured = fonts;
+        var blocking = new BlockingRunner(new AssfontsRunner(location));
+        using var processor = new SubtitleProcessor(location, () => configured, blocking, logger);
+        using var firstSource = new MemoryStream(input);
+        using var secondSource = new MemoryStream(input);
+        var first = processor.TransformAsync(firstSource, "ass", default);
+        await blocking.Entered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        var second = processor.TransformAsync(secondSource, "ass", default);
+        configured = Path.Combine(root, "new-fonts"); Directory.CreateDirectory(configured);
+        File.Copy(Directory.GetFiles(fonts)[0], Path.Combine(configured, "test.ttf"));
+        blocking.Release.TrySetResult();
+        await using var old = await first;
+        await using var current = await second;
+        Assert.Null(old);
+        Assert.NotNull(current);
+    }
+
+    [Fact]
+    public async Task CacheHitDoesNotReturnFontsFromAnOutdatedConfiguration()
+    {
+        var configured = fonts;
+        using var processor = new SubtitleProcessor(Path.Combine(root, "cache"), () => configured, runner, logger);
+        using var original = new MemoryStream(input);
+        await using var seeded = await processor.TransformAsync(original, "ass", default);
+        Assert.NotNull(seeded);
+        using var source = new BlockingReadStream(input);
+        var pending = processor.TransformAsync(source, "ass", default);
+        await source.Entered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        configured = "";
+        source.Release.TrySetResult();
+        await using var result = await pending;
+        Assert.Null(result);
+        Assert.Equal(0, source.Position);
+    }
+
+    [Theory]
+    [InlineData("fonts.json")]
+    [InlineData("state.json")]
+    public async Task RebuildsDamagedFontDatabase(string file)
+    {
+        using var source = new MemoryStream(input);
+        await using var initial = await cache.TransformAsync(source, "ass", default);
+        Assert.NotNull(initial);
+        File.WriteAllText(Path.Combine(root, "cache", "font-index", file), "damaged");
+        using var changed = new MemoryStream(Encoding.UTF8.GetBytes(Encoding.UTF8.GetString(input).Replace("ABC", "AC")));
+        await using var result = await cache.TransformAsync(changed, "ass", default);
+        Assert.NotNull(result);
+        var database = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(Path.Combine(root, "cache", "font-index", "fonts.json")))!.AsArray();
+        Assert.All(database, entry => Assert.Equal(Directory.GetFiles(fonts)[0], entry!["path"]!.GetValue<string>()));
+        Assert.NotEmpty(database);
+    }
+
+    [Fact]
     public async Task SubtitleAndFontChangesInvalidateCache()
     {
         async Task Generate(byte[] data) { using var s=new MemoryStream(data); await using var r=await cache.TransformAsync(s,"ass",default); Assert.NotNull(r); }
@@ -126,12 +232,10 @@ public sealed class CacheTests : IDisposable
     }
 
     [Fact]
-    public async Task EmptySettingAndOtherFormatsDoNotStartNativeProcess()
+    public async Task OtherFormatsDoNotStartNativeProcess()
     {
         using var source=new MemoryStream(input);
         Assert.Null(await cache.TransformAsync(source,"vtt",default));
-        using var disabled=new SubtitleProcessor(Path.Combine(root,"disabled"),()=>"",runner,NullLogger<SubtitleProcessor>.Instance);
-        Assert.Null(await disabled.TransformAsync(source,"ass",default));
         Assert.Equal(0,runner.Calls);
     }
 
@@ -231,6 +335,18 @@ public sealed class CacheTests : IDisposable
             if(failure=="throw") throw new IOException("deliberate runner failure");
             var output=Path.Combine(work,"invalid.ass");await File.WriteAllTextAsync(output,"not a subtitle",token);
             return new RunResult(true,output,"");
+        }
+    }
+
+    private sealed class BlockingReadStream(byte[] data) : MemoryStream(data)
+    {
+        public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken token = default)
+        {
+            Entered.TrySetResult();
+            await Release.Task.WaitAsync(token);
+            return await base.ReadAsync(buffer, token);
         }
     }
 

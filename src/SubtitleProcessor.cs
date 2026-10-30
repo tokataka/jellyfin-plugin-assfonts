@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
 using Microsoft.Extensions.Logging;
@@ -23,8 +22,6 @@ public sealed class SubtitleProcessor(string root, Func<string> getFontDirectory
     {
         token.ThrowIfCancellationRequested();
         if (extension is not ("ass" or "ssa") || !source.CanSeek || !source.CanRead) return null;
-        var fontDirectory = getFontDirectory().Trim();
-        if (fontDirectory.Length == 0) return null;
         var started = Stopwatch.GetTimestamp();
         context ??= new SubtitleLogContext("unknown");
         var position = source.Position;
@@ -45,13 +42,12 @@ public sealed class SubtitleProcessor(string root, Func<string> getFontDirectory
         try
         {
             if (source.Length - position > MaxInputBytes) return null;
-            if (!Path.IsPathFullyQualified(fontDirectory) || !Directory.Exists(fontDirectory))
-                throw new DirectoryNotFoundException("Font directory must be an existing absolute path.");
             // Bound temporary disk use as well as native-process concurrency.
             await gate.WaitAsync(deadline.Token);
             entered = true;
-            fontDirectory = Path.GetFullPath(fontDirectory);
-            var fontFingerprint = FontFingerprint(fontDirectory);
+            var fontDirectory = getFontDirectory().Trim();
+            var fontFingerprint = FontDirectorySnapshot.Capture(fontDirectory).Fingerprint;
+            RefreshFontState(fontFingerprint);
             cacheDirectory = Path.Combine(root, "subtitles");
             Directory.CreateDirectory(cacheDirectory);
             work = Path.Combine(root, "jobs", Guid.NewGuid().ToString("N"));
@@ -71,11 +67,13 @@ public sealed class SubtitleProcessor(string root, Func<string> getFontDirectory
                 }
             }
             var key = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(
-                "assfonts-cache-v2\0" + extension + "\0" + fontFingerprint + "\0" + AssfontsRunner.BinarySha256
+                "assfonts-cache-v3\0" + extension + "\0" + fontFingerprint + "\0" + AssfontsRunner.BinarySha256
                 + "\0" + Convert.ToHexStringLower(hash.GetHashAndReset()))));
             var destination = Path.Combine(cacheDirectory, key + "." + extension);
             var failed = Path.Combine(cacheDirectory, key + ".failed");
             failedPath = failed;
+            if (fontFingerprint != FontDirectorySnapshot.Capture(getFontDirectory()).Fingerprint)
+                throw new IOException("Fonts changed during processing; retaining original subtitle.");
             var cached = OpenCached(destination);
             if (cached is not null)
             {
@@ -97,7 +95,7 @@ public sealed class SubtitleProcessor(string root, Func<string> getFontDirectory
             var generated = await File.ReadAllTextAsync(result.OutputPath, deadline.Token);
             if (!generated.Contains("[Fonts]", StringComparison.Ordinal) || !generated.Contains("fontname:", StringComparison.Ordinal))
                 throw new InvalidDataException("assfonts output has no font attachments.");
-            if (fontFingerprint != FontFingerprint(fontDirectory))
+            if (fontFingerprint != FontDirectorySnapshot.Capture(getFontDirectory()).Fingerprint)
                 throw new IOException("Fonts changed during processing; retaining original subtitle.");
             File.Move(result.OutputPath, destination, true);
             if (File.Exists(failed)) File.Delete(failed);
@@ -138,22 +136,23 @@ public sealed class SubtitleProcessor(string root, Func<string> getFontDirectory
         }
     }
 
-    private static string FontFingerprint(string directory)
+    private void RefreshFontState(string fingerprint)
     {
-        var extensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { ".ttf", ".ttc", ".otf", ".otc" };
-        var files = EnumerateFonts(directory).Where(path => extensions.Contains(Path.GetExtension(path))).Order(StringComparer.Ordinal);
-        using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
-        hash.AppendData(Encoding.UTF8.GetBytes(directory + "\0"));
-        foreach (var path in files)
+        Directory.CreateDirectory(root);
+        var state = Path.Combine(root, "font-state.txt");
+        if (File.Exists(state) && File.ReadAllText(state) == fingerprint) return;
+        foreach (var name in new[] { "subtitles", "font-index" })
         {
-            var file = new FileInfo(path);
-            // assfonts follows font-file symlinks but not directory symlinks.
-            var target = file.ResolveLinkTarget(true);
-            if (target is not null) file = new FileInfo(target.FullName);
-            hash.AppendData(Encoding.UTF8.GetBytes(path + "\0" + file.FullName + "\0" + file.Length.ToString(CultureInfo.InvariantCulture)
-                + "\0" + file.LastWriteTimeUtc.Ticks.ToString(CultureInfo.InvariantCulture) + "\n"));
+            var directory = Path.Combine(root, name);
+            if (Directory.Exists(directory)) Directory.Delete(directory, true);
         }
-        return Convert.ToHexStringLower(hash.GetHashAndReset());
+        var temporary = state + "." + Guid.NewGuid().ToString("N");
+        try
+        {
+            File.WriteAllText(temporary, fingerprint);
+            File.Move(temporary, state, true);
+        }
+        finally { if (File.Exists(temporary)) File.Delete(temporary); }
     }
 
     internal static IEnumerable<string> EnumerateFonts(string directory)
