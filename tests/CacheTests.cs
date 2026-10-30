@@ -97,6 +97,9 @@ public sealed class CacheTests : IDisposable
         Assert.True(await Generate(input));
         Assert.True(File.Exists(database));
         Assert.Equal(Directory.GetFiles(fonts), IndexedPaths());
+        var state = System.Text.Json.Nodes.JsonNode.Parse(File.ReadAllText(Path.Combine(root, "cache", "font-index", "state.json")))!;
+        Assert.Equal(fonts, state["Directory"]?.GetValue<string>());
+        Assert.Equal(Directory.GetFiles(fonts), state["Files"]!.AsArray().Select(file => file!["Path"]!.GetValue<string>()));
         var markerTime = new DateTime(2001, 1, 1, 0, 0, 0, DateTimeKind.Utc);
         File.SetLastWriteTimeUtc(database, markerTime);
         Assert.True(await Generate(Encoding.UTF8.GetBytes(Encoding.UTF8.GetString(input).Replace("ABC", "AB"))));

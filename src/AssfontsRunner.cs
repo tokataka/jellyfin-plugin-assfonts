@@ -17,7 +17,7 @@ public sealed class AssfontsRunner(string cacheRoot) : IAssfontsRunner
 {
     public static string BinarySha256 => NativeBinary.Current.Checksum;
     private readonly SemaphoreSlim indexGate = new(1, 1);
-    private sealed record FontIndexState(string Fingerprint, string Checksum);
+    private sealed record FontIndexState(string Fingerprint, string Checksum, string Directory, IReadOnlyList<FontFile> Files);
 
     public async Task<RunResult> RunAsync(string input, string work, string fontDirectory, CancellationToken token)
     {
@@ -90,7 +90,8 @@ public sealed class AssfontsRunner(string cacheRoot) : IAssfontsRunner
             await File.WriteAllBytesAsync(builtDatabase, bytes, token);
             var stateFile = Path.Combine(build, "state.json");
             await File.WriteAllTextAsync(stateFile,
-                JsonSerializer.Serialize(new FontIndexState(fingerprint, Convert.ToHexStringLower(SHA256.HashData(bytes)))), token);
+                JsonSerializer.Serialize(new FontIndexState(fingerprint, Convert.ToHexStringLower(SHA256.HashData(bytes)),
+                    snapshot.Directory, snapshot.Files)), token);
             Directory.CreateDirectory(directory);
             File.Move(builtDatabase, database, true);
             File.Move(stateFile, statePath, true);
