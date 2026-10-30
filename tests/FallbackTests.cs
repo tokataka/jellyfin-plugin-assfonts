@@ -14,9 +14,12 @@ public sealed class FallbackTests(ITestOutputHelper output) : IDisposable
     private static readonly string Font = Path.Combine(AppContext.BaseDirectory, "Fixtures/fonts/test.ttf");
     private static readonly string LocalFont = Path.Combine(AppContext.BaseDirectory, "Fixtures/local-font.ttf");
 
-    private SubtitleProcessor Create(string directory, Func<string> fallback, string cacheName = "cache") =>
-        new(Path.Combine(root, cacheName), () => directory, new AssfontsRunner(Path.Combine(root, cacheName)),
-            new TestLogger(output), fallback);
+    private FontDatabase? database;
+    private async Task<SubtitleProcessor> Create(string directory, Func<string> fallback, string cacheName = "cache")
+    {
+        database = await TestFontDatabase.CreateAsync(Path.Combine(root, cacheName), () => new(directory, fallback()));
+        return new(Path.Combine(root, cacheName), database, new AssfontsRunner(Path.Combine(root, cacheName)), new TestLogger(output));
+    }
 
     private static async Task<string?> Process(SubtitleProcessor processor, string text)
     {
@@ -30,7 +33,7 @@ public sealed class FallbackTests(ITestOutputHelper output) : IDisposable
     [Fact]
     public async Task FallbackBindsStylesAndInlineOverridesToTheEmbeddedFont()
     {
-        using var processor = Create("", () => Font);
+        using var processor = await Create("", () => Font);
         var input = Subtitle.Replace("AssFonts Test", "Missing Style Font").Replace("가나다 ABC", @"가나다 {\fnMissing Inline Font}ABC");
         var result = await Process(processor, input);
         Assert.NotNull(result);
@@ -38,7 +41,7 @@ public sealed class FallbackTests(ITestOutputHelper output) : IDisposable
         Assert.DoesNotContain("Style: Default,Missing Style Font,", result);
         Assert.DoesNotContain(@"\fnMissing Inline Font}", result);
         // Reprocess using only the generated attachments: font names in the subtitle must resolve.
-        using var verify = Create("", () => "", "verify");
+        using var verify = await Create("", () => "", "verify");
         Assert.NotNull(await Process(verify, result));
         Assert.Empty(Directory.GetDirectories(Path.Combine(root, "cache", "jobs")));
     }
@@ -49,7 +52,7 @@ public sealed class FallbackTests(ITestOutputHelper output) : IDisposable
         var fonts = Path.Combine(root, "fonts"); Directory.CreateDirectory(fonts);
         File.Copy(Font, Path.Combine(fonts, "external.ttf"));
         var input = AttachmentTests.WithFont(Subtitle.Replace("가나다 ABC", @"가나다 ABC{\fnMissing Font}ABC"), File.ReadAllBytes(Font), "attached.ttf");
-        using var processor = Create(fonts, () => LocalFont);
+        using var processor = await Create(fonts, () => LocalFont);
         var result = await Process(processor, input);
         Assert.NotNull(result);
         Assert.Contains("fontname: font-0000[", result);
@@ -66,14 +69,14 @@ public sealed class FallbackTests(ITestOutputHelper output) : IDisposable
     {
         Directory.CreateDirectory(root);
         var fallback = setting == "missing" ? Path.Combine(root, "missing.ttf") : setting == "directory" ? root : setting;
-        using var processor = Create("", () => fallback);
+        using var processor = await Create("", () => fallback);
         Assert.Null(await Process(processor, Subtitle.Replace("AssFonts Test", "Missing Font")));
     }
 
     [Fact]
     public async Task FallbackWithoutRequiredGlyphsLeavesTheOriginalSubtitle()
     {
-        using var processor = Create("", () => LocalFont);
+        using var processor = await Create("", () => LocalFont);
         Assert.Null(await Process(processor, Subtitle.Replace("AssFonts Test", "Missing Font").Replace("ABC", "🦄")));
     }
 
@@ -81,26 +84,29 @@ public sealed class FallbackTests(ITestOutputHelper output) : IDisposable
     public async Task FallbackSettingChangeInvalidatesTheSubtitleCache()
     {
         var fallback = Font;
-        using var processor = Create("", () => fallback);
+        using var processor = await Create("", () => fallback);
         var input = Subtitle.Replace("AssFonts Test", "Missing Font");
         Assert.NotNull(await Process(processor, input));
         fallback = "";
+        await database!.RebuildAsync();
         Assert.Null(await Process(processor, input));
         fallback = Font;
+        await database!.RebuildAsync();
         Assert.NotNull(await Process(processor, input));
     }
 
     [Fact]
-    public async Task FallbackFileReplacementInvalidatesTheSubtitleCache()
+    public async Task RebuildingAfterFallbackReplacementInvalidatesTheSubtitleCache()
     {
         Directory.CreateDirectory(root);
         var fallback = Path.Combine(root, "fallback.ttf");
         File.Copy(Font, fallback);
-        using var processor = Create("", () => fallback);
+        using var processor = await Create("", () => fallback);
         var input = Subtitle.Replace("AssFonts Test", "Missing Font");
         var original = await Process(processor, input);
         Assert.NotNull(original);
         File.Copy(LocalFont, fallback, true);
+        await database!.RebuildAsync();
         var replaced = await Process(processor, input);
         Assert.NotNull(replaced);
         Assert.NotEqual(original, replaced);

@@ -1,7 +1,3 @@
-using System.Diagnostics;
-using System.Text;
-using System.Security.Cryptography;
-using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 
@@ -11,38 +7,33 @@ public sealed record RunResult(bool Success, string OutputPath, string Detail);
 
 public interface IAssfontsRunner
 {
-    Task<RunResult> RunAsync(string input, string work, string fontDirectory, CancellationToken token, string fallbackFont = "");
+    Task<RunResult> RunAsync(string input, string work, FontDatabaseSnapshot fonts, CancellationToken token);
 }
 
 public sealed class AssfontsRunner(string cacheRoot) : IAssfontsRunner
 {
     public static string BinarySha256 => NativeBinary.Current.Checksum;
-    private readonly SemaphoreSlim indexGate = new(1, 1);
-    private sealed record FontIndexState(string Fingerprint, string Checksum, string Directory, IReadOnlyList<FontFile> Files);
 
-    public async Task<RunResult> RunAsync(string input, string work, string fontDirectory, CancellationToken token, string fallbackFont = "")
+    public async Task<RunResult> RunAsync(string input, string work, FontDatabaseSnapshot fonts, CancellationToken token)
     {
         var binary = await NativeBinary.ExtractAsync(cacheRoot, token);
         var attachedDirectory = Path.Combine(work, "attached-fonts");
         var attachedFonts = await AttachedFonts.ExtractAsync(input, attachedDirectory, token);
-        var database = JsonNode.Parse(await GetFontDatabaseAsync(binary, work, fontDirectory, token))!.AsArray();
-        if (attachedFonts > 0)
-        {
-            var attachments = await BuildFontDatabaseAsync(binary, Path.Combine(work, "attachment-index"),
-                FontDirectorySnapshot.Capture(attachedDirectory), token);
-            PrioritizeAttachments(database, attachments);
-        }
+        var database = JsonNode.Parse(fonts.Fonts)!.AsArray();
         await File.WriteAllTextAsync(Path.Combine(work, "fonts.json"), database.ToJsonString(), token);
-        var arguments = new[] { "-d", work, "-o", work, "-m", "1", "-i", input };
-        var result = await ExecuteAsync(binary, work, arguments, token);
+        var arguments = new List<string> { "-d", work, "-o", work, "-m", "1" };
+        // -f builds an in-memory attachment index without scanning default system directories.
+        // Native lookup searches this index before the persistent directory database.
+        if (attachedFonts > 0) arguments.AddRange(new[] { "-f", attachedDirectory });
+        arguments.AddRange(new[] { "-i", input });
+        var result = await AssfontsNative.ExecuteAsync(binary, work, arguments, token);
         var stem = Path.GetFileNameWithoutExtension(input);
         var output = Path.Combine(work, stem + ".assfonts" + Path.GetExtension(input));
         var missing = Regex.Matches(result.Detail, @"(?m)^\[WARN\] Missing the font: ""(.*)"" \(-?\d+,-?\d+\)\r?$",
             RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1)).Select(match => match.Groups[1].Value).Distinct().ToArray();
-        var fallback = FallbackFontSnapshot.Capture(fallbackFont);
-        if (!result.Success && missing.Length > 0 && fallback.File is not null)
+        if (!result.Success && missing.Length > 0 && fonts.Fallback is not null)
         {
-            var replacement = await GetFallbackEntryAsync(binary, work, database, fallback, token);
+            var replacement = JsonNode.Parse(fonts.Fallback);
             if (replacement is not null)
             {
                 replacement["families"] = new JsonArray(missing.Select(name => JsonValue.Create(name.ToLowerInvariant())).ToArray());
@@ -51,201 +42,11 @@ public sealed class AssfontsRunner(string cacheRoot) : IAssfontsRunner
                 database.Add(replacement);
                 await File.WriteAllTextAsync(Path.Combine(work, "fonts.json"), database.ToJsonString(), token);
                 // Rename both the subset's internal family and ASS references; a filename alone cannot bind a fallback.
-                result = await ExecuteAsync(binary, work, arguments.Concat(new[] { "-r" }), token);
+                result = await AssfontsNative.ExecuteAsync(binary, work, arguments.Concat(new[] { "-r" }), token);
                 output = Path.Combine(work, stem + ".rename.assfonts" + Path.GetExtension(input));
             }
         }
         return new RunResult(result.Success && File.Exists(output), output, result.Detail);
     }
 
-    private async Task<byte[]> GetFontDatabaseAsync(string binary, string work, string configured, CancellationToken token)
-    {
-        await indexGate.WaitAsync(token);
-        try
-        {
-            var snapshot = FontDirectorySnapshot.Capture(configured);
-            var directory = Path.Combine(cacheRoot, "font-index");
-            if (snapshot.Files.Count == 0)
-            {
-                if (Directory.Exists(directory)) Directory.Delete(directory, true);
-                return "[]"u8.ToArray();
-            }
-            var fingerprint = BinarySha256 + ":" + snapshot.Fingerprint;
-            var saved = await ReadDatabaseAsync(directory, fingerprint, token);
-            if (saved is not null) return saved;
-
-            // Rebuild from an empty database so removed files cannot remain in the index.
-            if (Directory.Exists(directory)) Directory.Delete(directory, true);
-            var build = Path.Combine(work, "font-index");
-            var entries = await BuildFontDatabaseAsync(binary, build, snapshot, token);
-            if (snapshot.Fingerprint != FontDirectorySnapshot.Capture(configured).Fingerprint)
-                throw new IOException("Fonts changed while building the font database.");
-            var bytes = Encoding.UTF8.GetBytes(entries.ToJsonString());
-            await SaveDatabaseAsync(directory, build, bytes, new FontIndexState(fingerprint,
-                Convert.ToHexStringLower(SHA256.HashData(bytes)), snapshot.Directory, snapshot.Files), token);
-            return bytes;
-        }
-        finally { indexGate.Release(); }
-    }
-
-    private async Task<JsonNode?> GetFallbackEntryAsync(string binary, string work, JsonArray database,
-        FallbackFontSnapshot snapshot, CancellationToken token)
-    {
-        var file = snapshot.File!;
-        var comparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
-        var existing = database.Where(entry => comparer.Equals(PathKey(entry!["path"]!.GetValue<string>()), PathKey(file.ResolvedPath)))
-            .OrderBy(entry => entry!["index"]!.GetValue<int>()).FirstOrDefault();
-        if (existing is not null) return existing.DeepClone();
-        await indexGate.WaitAsync(token);
-        try
-        {
-            var directory = Path.Combine(cacheRoot, "fallback-index");
-            var fingerprint = BinarySha256 + ":" + snapshot.Fingerprint;
-            var saved = await ReadDatabaseAsync(directory, fingerprint, token);
-            JsonArray entries;
-            if (saved is not null) entries = JsonNode.Parse(saved)!.AsArray();
-            else
-            {
-                if (Directory.Exists(directory)) Directory.Delete(directory, true);
-                var build = Path.Combine(work, "fallback-index");
-                var staged = Path.Combine(build, "font");
-                Directory.CreateDirectory(staged);
-                // Limit indexing to this file, even if its parent contains many unrelated fonts.
-                var copy = Path.Combine(staged, "fallback" + Path.GetExtension(file.Path));
-                await using (var source = System.IO.File.OpenRead(file.ResolvedPath))
-                await using (var target = System.IO.File.Create(copy))
-                    await source.CopyToAsync(target, token);
-                entries = await BuildFontDatabaseAsync(binary, build, FontDirectorySnapshot.Capture(staged), token);
-                foreach (var entry in entries) entry!["path"] = file.ResolvedPath;
-                if (snapshot.Fingerprint != FallbackFontSnapshot.Capture(file.Path).Fingerprint)
-                    throw new IOException("Fallback font changed while building the font database.");
-                var bytes = Encoding.UTF8.GetBytes(entries.ToJsonString());
-                await SaveDatabaseAsync(directory, build, bytes, new FontIndexState(fingerprint,
-                    Convert.ToHexStringLower(SHA256.HashData(bytes)), Path.GetDirectoryName(file.Path)!, new[] { file }), token);
-            }
-            return entries.OrderBy(entry => entry!["index"]!.GetValue<int>()).FirstOrDefault()?.DeepClone();
-        }
-        finally { indexGate.Release(); }
-    }
-
-    private static async Task<byte[]?> ReadDatabaseAsync(string directory, string fingerprint, CancellationToken token)
-    {
-        try
-        {
-            var state = JsonSerializer.Deserialize<FontIndexState>(await File.ReadAllTextAsync(Path.Combine(directory, "state.json"), token));
-            if (state?.Fingerprint == fingerprint)
-            {
-                var saved = await File.ReadAllBytesAsync(Path.Combine(directory, "fonts.json"), token);
-                if (Convert.ToHexStringLower(SHA256.HashData(saved)) == state.Checksum) return saved;
-            }
-        }
-        catch (Exception exception) when (exception is IOException or JsonException) { }
-        return null;
-    }
-
-    private static async Task SaveDatabaseAsync(string directory, string build, byte[] bytes,
-        FontIndexState state, CancellationToken token)
-    {
-        var database = Path.Combine(build, "fonts.json");
-        var stateFile = Path.Combine(build, "state.json");
-        await File.WriteAllBytesAsync(database, bytes, token);
-        await File.WriteAllTextAsync(stateFile, JsonSerializer.Serialize(state), token);
-        Directory.CreateDirectory(directory);
-        File.Move(database, Path.Combine(directory, "fonts.json"), true);
-        File.Move(stateFile, Path.Combine(directory, "state.json"), true);
-    }
-
-    private static async Task<JsonArray> BuildFontDatabaseAsync(string binary, string build,
-        FontDirectorySnapshot snapshot, CancellationToken token)
-    {
-        Directory.CreateDirectory(build);
-        var builtDatabase = Path.Combine(build, "fonts.json");
-        await File.WriteAllTextAsync(builtDatabase, "[]", token);
-        var indexed = await ExecuteAsync(binary, build, new[] { "-b", "-f", snapshot.Directory, "-d", build }, token);
-        if (!indexed.Success) throw new IOException("Could not build font database: " + indexed.Detail);
-        var entries = JsonNode.Parse(await File.ReadAllTextAsync(builtDatabase, token))!.AsArray();
-        var comparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
-        var allowed = snapshot.Files.ToDictionary(file => PathKey(file.Path), file => file.ResolvedPath, comparer);
-        for (var i = entries.Count - 1; i >= 0; i--)
-        {
-            var entry = entries[i]!;
-            var path = entry["path"]!.GetValue<string>();
-            // assfonts -b also scans system fonts; retain only the configured directory.
-            if (!allowed.TryGetValue(PathKey(path), out var resolved)) { entries.RemoveAt(i); continue; }
-            // assfonts 0.7.3 sizes Windows symlinks instead of their targets during subsetting.
-            entry["path"] = resolved;
-        }
-        return entries;
-    }
-
-    private static readonly string[] NameFields = ["families", "fullnames", "psnames"];
-
-    private static void PrioritizeAttachments(JsonArray database, JsonArray attachments)
-    {
-        var names = attachments.SelectMany(entry => NameFields.SelectMany(field => entry![field]!.AsArray()))
-            .Select(name => name!.GetValue<string>()).ToHashSet(StringComparer.OrdinalIgnoreCase);
-        foreach (var entry in database)
-            foreach (var field in NameFields)
-            {
-                var aliases = entry![field]!.AsArray();
-                for (var i = aliases.Count - 1; i >= 0; i--)
-                    if (names.Contains(aliases[i]!.GetValue<string>())) aliases.RemoveAt(i);
-            }
-        foreach (var entry in attachments) database.Add(entry!.DeepClone());
-    }
-
-    private static string PathKey(string path)
-    {
-        var full = Path.GetFullPath(path);
-        return OperatingSystem.IsWindows() ? WindowsPathKey(full) : full;
-    }
-
-    private static string WindowsPathKey(string path) =>
-        path.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase) ? @"\\" + path[8..] :
-        path.StartsWith(@"\\?\", StringComparison.Ordinal) ? path[4..] : path;
-
-    private static async Task<(bool Success, string Detail)> ExecuteAsync(string binary, string work,
-        IEnumerable<string> arguments, CancellationToken token)
-    {
-        var info = new ProcessStartInfo(binary)
-        {
-            WorkingDirectory = work, UseShellExecute = false, CreateNoWindow = true,
-            RedirectStandardOutput = true, RedirectStandardError = true
-        };
-        foreach (var argument in arguments)
-            info.ArgumentList.Add(argument);
-        using var process = Process.Start(info) ?? throw new IOException("Could not start assfonts.");
-        var stdout = CaptureAsync(process.StandardOutput);
-        var stderr = CaptureAsync(process.StandardError);
-        try { await process.WaitForExitAsync(token); }
-        catch (OperationCanceledException)
-        {
-            try { if (!process.HasExited) process.Kill(entireProcessTree: true); }
-            catch (InvalidOperationException) { }
-            await process.WaitForExitAsync(CancellationToken.None);
-            await Task.WhenAll(stdout, stderr);
-            throw;
-        }
-        var logs = await Task.WhenAll(stdout, stderr);
-        return (process.ExitCode == 0 && !logs.Any(l => l.Bad),
-            $"assfonts exit code: {process.ExitCode}\n" + string.Join("\n", logs.Select(l => l.Text)));
-    }
-
-    private static async Task<(bool Bad, string Text)> CaptureAsync(StreamReader reader)
-    {
-        var text = new StringBuilder();
-        var buffer = new char[4096];
-        var tail = string.Empty;
-        var bad = false;
-        int count;
-        while ((count = await reader.ReadAsync(buffer)) > 0)
-        {
-            var chunk = tail + new string(buffer, 0, count);
-            bad |= chunk.Contains("[ERROR]", StringComparison.Ordinal)
-                || chunk.Contains("Missing codepoints", StringComparison.Ordinal);
-            tail = chunk[^Math.Min(32, chunk.Length)..];
-            if (text.Length < 65536) text.Append(buffer, 0, Math.Min(count, 65536 - text.Length));
-        }
-        return (bad, text.ToString());
-    }
 }

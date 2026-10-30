@@ -18,7 +18,7 @@ public sealed class AttachmentTests : IDisposable
     {
         var fonts = Path.Combine(root, "fonts"); Directory.CreateDirectory(fonts);
         var input = WithFont(Subtitle, Font, "../../outside.ttf", atEnd);
-        using var cache = CreateCache(fonts);
+        using var cache = await CreateCache(fonts);
         for (var request = 0; request < 2; request++)
         {
             using var source = new MemoryStream(Encoding.UTF8.GetBytes(input));
@@ -52,7 +52,7 @@ public sealed class AttachmentTests : IDisposable
             _ => ""
         };
         if (setting == "file") File.WriteAllText(directory, "not a directory");
-        using var processor = CreateCache(directory);
+        using var processor = await CreateCache(directory);
         var input = WithFont(Subtitle, Font, "attached.ttf");
         using var source = new MemoryStream(Encoding.UTF8.GetBytes(input));
         await using var result = await processor.TransformAsync(source, "ass", default);
@@ -66,7 +66,7 @@ public sealed class AttachmentTests : IDisposable
     {
         var fonts = Path.Combine(root, "fonts"); Directory.CreateDirectory(fonts);
         File.WriteAllBytes(Path.Combine(fonts, "external.ttf"), Font);
-        using var processor = CreateCache(fonts);
+        using var processor = await CreateCache(fonts);
         using var source = new MemoryStream(Encoding.UTF8.GetBytes(WithFont(Subtitle, Font, "attached.ttf")));
         await using var result = await processor.TransformAsync(source, "ass", default);
         Assert.NotNull(result);
@@ -81,7 +81,7 @@ public sealed class AttachmentTests : IDisposable
         var fonts = Path.Combine(root, "fonts"); Directory.CreateDirectory(fonts);
         File.WriteAllBytes(Path.Combine(fonts, "test.ttf"), Font);
         var input = Subtitle.Replace("[Events]", "[Fonts]\nfontname: broken.ttf\n~~~~\n[Events]");
-        using var cache = CreateCache(fonts);
+        using var cache = await CreateCache(fonts);
         using var source = new MemoryStream(Encoding.UTF8.GetBytes(input));
         Assert.Null(await cache.TransformAsync(source, "ass", default));
         Assert.Equal(0, source.Position);
@@ -89,8 +89,11 @@ public sealed class AttachmentTests : IDisposable
         Assert.Empty(Directory.GetDirectories(Path.Combine(root, "cache/jobs")));
     }
 
-    private SubtitleProcessor CreateCache(string fonts) => new(Path.Combine(root, "cache"), () => fonts,
-        new AssfontsRunner(Path.Combine(root, "cache")), NullLogger<SubtitleProcessor>.Instance);
+    private async Task<SubtitleProcessor> CreateCache(string fonts)
+    {
+        var database = await TestFontDatabase.CreateAsync(Path.Combine(root, "cache"), () => new(fonts, ""));
+        return new(Path.Combine(root, "cache"), database, new AssfontsRunner(Path.Combine(root, "cache")), NullLogger<SubtitleProcessor>.Instance);
+    }
 
     [Fact]
     public async Task CombinesAttachedAndConfiguredFonts()
@@ -98,7 +101,7 @@ public sealed class AttachmentTests : IDisposable
         var fonts = Path.Combine(root, "fonts"); Directory.CreateDirectory(fonts);
         File.Copy(Path.Combine(AppContext.BaseDirectory, "Fixtures/local-font.ttf"), Path.Combine(fonts, "local.ttf"));
         var mixed = Subtitle.Replace("가나다 ABC", @"가나다 {\fnLocalFont Test}ABC");
-        using var cache = CreateCache(fonts);
+        using var cache = await CreateCache(fonts);
         using var source = new MemoryStream(Encoding.UTF8.GetBytes(WithFont(mixed, Font, "attached.ttf")));
         await using var result = await cache.TransformAsync(source, "ass", default);
         Assert.NotNull(result);
@@ -116,13 +119,14 @@ public sealed class AttachmentTests : IDisposable
         File.Copy(Path.Combine(AppContext.BaseDirectory, "Fixtures/local-font.ttf"), local);
         var cacheRoot = Path.Combine(root, "cache");
         var runner = new InspectingRunner(new AssfontsRunner(cacheRoot));
-        using var processor = new SubtitleProcessor(cacheRoot, () => fonts, runner, NullLogger<SubtitleProcessor>.Instance);
+        using var database = await TestFontDatabase.CreateAsync(cacheRoot, () => new(fonts, ""));
+        using var processor = new SubtitleProcessor(cacheRoot, database, runner, NullLogger<SubtitleProcessor>.Instance);
         var mixed = Subtitle.Replace("가나다 ABC", @"가나다 {\fnLocalFont Test}ABC");
         using var source = new MemoryStream(Encoding.UTF8.GetBytes(WithFont(mixed, Font, "attached.ttf")));
         await using var result = await processor.TransformAsync(source, "ass", default);
         Assert.NotNull(result);
-        Assert.True(runner.AttachmentIndexExisted);
-        Assert.Equal(2, runner.IndexedPaths.Length);
+        Assert.True(runner.ParsedAttachments);
+        Assert.Single(runner.IndexedPaths);
         Assert.Contains(local, runner.IndexedPaths);
         var permanent = File.ReadAllText(Path.Combine(cacheRoot, "font-index", "fonts.json"));
         Assert.DoesNotContain("font-0000", permanent);
@@ -131,18 +135,18 @@ public sealed class AttachmentTests : IDisposable
         using var localSource = new MemoryStream(Encoding.UTF8.GetBytes(Subtitle.Replace("AssFonts Test", "LocalFont Test").Replace("가나다 ABC", "ABC")));
         await using var localResult = await processor.TransformAsync(localSource, "ass", default);
         Assert.NotNull(localResult);
-        Assert.False(runner.AttachmentIndexExisted);
+        Assert.False(runner.ParsedAttachments);
         Assert.Equal(new[] { local }, runner.IndexedPaths);
     }
 
     private sealed class InspectingRunner(IAssfontsRunner inner) : IAssfontsRunner
     {
-        public bool AttachmentIndexExisted { get; private set; }
+        public bool ParsedAttachments { get; private set; }
         public string[] IndexedPaths { get; private set; } = [];
-        public async Task<RunResult> RunAsync(string input, string work, string fontDirectory, CancellationToken token, string fallbackFont = "")
+        public async Task<RunResult> RunAsync(string input, string work, FontDatabaseSnapshot fonts, CancellationToken token)
         {
-            var result = await inner.RunAsync(input, work, fontDirectory, token, fallbackFont);
-            AttachmentIndexExisted = File.Exists(Path.Combine(work, "attachment-index", "fonts.json"));
+            var result = await inner.RunAsync(input, work, fonts, token);
+            ParsedAttachments = result.Detail.Contains("attached-fonts") && result.Detail.Contains("Parsing font files");
             IndexedPaths = System.Text.Json.Nodes.JsonNode.Parse(await File.ReadAllTextAsync(Path.Combine(work, "fonts.json"), token))!.AsArray()
                 .Select(entry => entry!["path"]!.GetValue<string>()).Distinct().ToArray();
             return result;

@@ -1,10 +1,6 @@
-using System.Globalization;
-using System.Security.Cryptography;
-using System.Text;
-
 namespace Jellyfin.Plugin.AssFonts;
 
-internal sealed record FallbackFontSnapshot(FontFile? File, string Fingerprint)
+internal sealed record FallbackFontSnapshot(FontFile? File)
 {
     public static FallbackFontSnapshot Capture(string setting)
     {
@@ -19,12 +15,10 @@ internal sealed record FallbackFontSnapshot(FontFile? File, string Fingerprint)
                 var target = source.ResolveLinkTarget(true);
                 var resolved = target is null ? source : new FileInfo(target.FullName);
                 if (resolved.Length <= SubtitleProcessor.MaxInputBytes)
-                    file = new(source.FullName, resolved.FullName, resolved.Length, resolved.LastWriteTimeUtc.Ticks);
+                    file = new(source.FullName, resolved.FullName);
             }
         }
         catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException) { }
-        var text = configured + "\0" + file?.ResolvedPath + "\0"
-            + file?.Length.ToString(CultureInfo.InvariantCulture) + "\0" + file?.ModifiedTicks.ToString(CultureInfo.InvariantCulture);
-        return new(file, Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(text))));
+        return new(file);
     }
 }

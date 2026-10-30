@@ -10,8 +10,8 @@ public interface ISubtitleProcessor
     Task<Stream?> TransformAsync(Stream source, string extension, CancellationToken token, SubtitleLogContext? context = null);
 }
 
-public sealed class SubtitleProcessor(string root, Func<string> getFontDirectory,
-    IAssfontsRunner runner, ILogger<SubtitleProcessor> logger, Func<string>? getFallbackFont = null) : ISubtitleProcessor, IDisposable
+public sealed class SubtitleProcessor(string root, FontDatabase database,
+    IAssfontsRunner runner, ILogger<SubtitleProcessor> logger) : ISubtitleProcessor, IDisposable
 {
     public const long MaxInputBytes = 128L * 1024 * 1024;
     private const long MaxCacheBytes = 1024L * 1024 * 1024;
@@ -45,11 +45,8 @@ public sealed class SubtitleProcessor(string root, Func<string> getFontDirectory
             // Bound temporary disk use as well as native-process concurrency.
             await gate.WaitAsync(deadline.Token);
             entered = true;
-            var fontDirectory = getFontDirectory().Trim();
-            var fallbackFont = getFallbackFont?.Invoke() ?? string.Empty;
-            var fallbackFingerprint = FallbackFontSnapshot.Capture(fallbackFont).Fingerprint;
-            var fontFingerprint = FontDirectorySnapshot.Capture(fontDirectory).Fingerprint;
-            RefreshFontState(fontFingerprint);
+            var fonts = await database.GetSnapshotAsync(deadline.Token);
+            if (!database.IsCurrent(fonts)) throw new IOException("Font database is awaiting a settings update.");
             cacheDirectory = Path.Combine(root, "subtitles");
             Directory.CreateDirectory(cacheDirectory);
             work = Path.Combine(root, "jobs", Guid.NewGuid().ToString("N"));
@@ -69,15 +66,14 @@ public sealed class SubtitleProcessor(string root, Func<string> getFontDirectory
                 }
             }
             var key = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(
-                "assfonts-cache-v4\0" + extension + "\0" + fontFingerprint + "\0" + fallbackFingerprint + "\0" + AssfontsRunner.BinarySha256
+                "assfonts-cache-v5\0" + extension + "\0" + fonts.BuiltAtUtc.Ticks.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\0" + AssfontsRunner.BinarySha256
                 + "\0" + Convert.ToHexStringLower(hash.GetHashAndReset()))));
             var destination = Path.Combine(cacheDirectory, key + "." + extension);
             var failed = Path.Combine(cacheDirectory, key + ".failed");
             failedPath = failed;
-            if (fontFingerprint != FontDirectorySnapshot.Capture(getFontDirectory()).Fingerprint
-                || fallbackFingerprint != FallbackFontSnapshot.Capture(getFallbackFont?.Invoke() ?? string.Empty).Fingerprint)
+            if (!database.IsCurrent(fonts))
                 throw new IOException("Fonts changed during processing; retaining original subtitle.");
-            var cached = OpenCached(destination);
+            var cached = OpenCached(destination, fonts.BuiltAtUtc);
             if (cached is not null)
             {
                 LogProcessed(cached, true);
@@ -85,7 +81,7 @@ public sealed class SubtitleProcessor(string root, Func<string> getFontDirectory
             }
             if (File.Exists(failed) && DateTime.UtcNow - File.GetLastWriteTimeUtc(failed) < TimeSpan.FromMinutes(1)) return null;
 
-            var result = await runner.RunAsync(input, work, fontDirectory, deadline.Token, fallbackFont);
+            var result = await runner.RunAsync(input, work, fonts, deadline.Token);
             if (!result.Success)
             {
                 RememberFailure(failedPath);
@@ -98,12 +94,11 @@ public sealed class SubtitleProcessor(string root, Func<string> getFontDirectory
             var generated = await File.ReadAllTextAsync(result.OutputPath, deadline.Token);
             if (!generated.Contains("[Fonts]", StringComparison.Ordinal) || !generated.Contains("fontname:", StringComparison.Ordinal))
                 throw new InvalidDataException("assfonts output has no font attachments.");
-            if (fontFingerprint != FontDirectorySnapshot.Capture(getFontDirectory()).Fingerprint
-                || fallbackFingerprint != FallbackFontSnapshot.Capture(getFallbackFont?.Invoke() ?? string.Empty).Fingerprint)
+            if (!database.IsCurrent(fonts))
                 throw new IOException("Fonts changed during processing; retaining original subtitle.");
             File.Move(result.OutputPath, destination, true);
             if (File.Exists(failed)) File.Delete(failed);
-            var processed = OpenCached(destination);
+            var processed = OpenCached(destination, fonts.BuiltAtUtc);
             if (processed is not null) LogProcessed(processed, false);
             return processed;
         }
@@ -140,35 +135,6 @@ public sealed class SubtitleProcessor(string root, Func<string> getFontDirectory
         }
     }
 
-    private void RefreshFontState(string fingerprint)
-    {
-        Directory.CreateDirectory(root);
-        var state = Path.Combine(root, "font-state.txt");
-        if (File.Exists(state) && File.ReadAllText(state) == fingerprint) return;
-        foreach (var name in new[] { "subtitles", "font-index" })
-        {
-            var directory = Path.Combine(root, name);
-            if (Directory.Exists(directory)) Directory.Delete(directory, true);
-        }
-        var temporary = state + "." + Guid.NewGuid().ToString("N");
-        try
-        {
-            File.WriteAllText(temporary, fingerprint);
-            File.Move(temporary, state, true);
-        }
-        finally { if (File.Exists(temporary)) File.Delete(temporary); }
-    }
-
-    internal static IEnumerable<string> EnumerateFonts(string directory)
-    {
-        foreach (var item in new DirectoryInfo(directory).EnumerateFileSystemInfos())
-        {
-            if ((item.Attributes & FileAttributes.Directory) == 0) yield return item.FullName;
-            else if ((item.Attributes & FileAttributes.ReparsePoint) == 0)
-                foreach (var file in EnumerateFonts(item.FullName)) yield return file;
-        }
-    }
-
     private void RememberFailure(string? path)
     {
         if (path is null) return;
@@ -177,11 +143,12 @@ public sealed class SubtitleProcessor(string root, Func<string> getFontDirectory
         catch (UnauthorizedAccessException ex) { logger.LogDebug(ex, "Could not record ASS Fonts failure backoff."); }
     }
 
-    private static Stream? OpenCached(string path)
+    private static Stream? OpenCached(string path, DateTime builtAtUtc)
     {
         try
         {
-            if (!File.Exists(path) || DateTime.UtcNow - File.GetLastWriteTimeUtc(path) > CacheLifetime) return null;
+            if (!File.Exists(path) || File.GetLastWriteTimeUtc(path) < builtAtUtc
+                || DateTime.UtcNow - File.GetLastWriteTimeUtc(path) > CacheLifetime) return null;
             var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete);
             if (stream.Length == 0) { stream.Dispose(); return null; }
             File.SetLastWriteTimeUtc(path, DateTime.UtcNow);
