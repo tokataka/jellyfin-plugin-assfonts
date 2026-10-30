@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import re
+import subprocess
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
@@ -25,6 +26,17 @@ def read_version(root=ROOT):
     value = ET.parse(root / 'Directory.Build.props').findtext('.//Version', '').strip()
     version_tuple(value)
     return value
+
+
+def version_bumped(before, root=ROOT):
+    if not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', before):
+        raise ValueError('Expected the commit ID from the push event')
+    current = version_tuple(read_version(root))
+    if set(before) == {'0'}:
+        return True
+    previous = subprocess.check_output(['git', 'show', f'{before}:Directory.Build.props'], cwd=root, text=True)
+    old = ET.fromstring(previous).findtext('.//Version', '').strip()
+    return current > version_tuple(old)
 
 
 def package(root=ROOT):
@@ -101,17 +113,21 @@ def draft_asset_action(assets, name):
     raise ValueError(f'Unknown draft asset state for {name}')
 
 
-def verify_asset(archive, release):
+def verify_asset(archive, release, built_archive=None):
     asset = next((item for item in release['assets'] if item['name'] == archive.name), {})
     actual = 'sha256:' + hashlib.sha256(archive.read_bytes()).hexdigest()
     if asset.get('digest') != actual:
         raise ValueError('GitHub release asset SHA-256 is unavailable or does not match the downloaded ZIP')
+    if built_archive is not None and archive.read_bytes() != built_archive.read_bytes():
+        raise ValueError('Published asset does not match the tested build; publish a new version')
 
 
 def main():
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest='command', required=True)
     commands.add_parser('version')
+    bump = commands.add_parser('version-bumped')
+    bump.add_argument('--before', required=True)
     commands.add_parser('package')
     asset = commands.add_parser('draft-asset-action')
     asset.add_argument('--assets', type=Path, required=True)
@@ -119,6 +135,7 @@ def main():
     verify = commands.add_parser('verify')
     verify.add_argument('--zip', type=Path, required=True)
     verify.add_argument('--release', type=Path, required=True)
+    verify.add_argument('--built-zip', type=Path)
     merge = commands.add_parser('index')
     merge.add_argument('--zip', type=Path, required=True)
     merge.add_argument('--repository', required=True)
@@ -127,12 +144,14 @@ def main():
     args = parser.parse_args()
     if args.command == 'version':
         print(read_version())
+    elif args.command == 'version-bumped':
+        print(str(version_bumped(args.before)).lower())
     elif args.command == 'package':
         print(package())
     elif args.command == 'draft-asset-action':
         print(draft_asset_action(json.loads(args.assets.read_text())['assets'], args.name))
     elif args.command == 'verify':
-        verify_asset(args.zip, json.loads(args.release.read_text()))
+        verify_asset(args.zip, json.loads(args.release.read_text()), args.built_zip)
     else:
         release = json.loads(args.release.read_text())
         entry = make_entry(args.zip, args.repository, release['publishedAt'], release['body'])

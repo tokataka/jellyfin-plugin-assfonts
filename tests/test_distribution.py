@@ -2,6 +2,7 @@ import copy
 import hashlib
 import importlib.util
 import json
+import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -48,6 +49,32 @@ class DistributionTests(unittest.TestCase):
                     f'<Project><PropertyGroup><Version>{version}</Version></PropertyGroup></Project>')
                 with self.assertRaises(ValueError):
                     self.dist.read_version(self.root)
+
+    def test_release_requires_a_version_increase_across_the_whole_push(self):
+        def git(*args):
+            return subprocess.check_output(['git', '-C', str(self.root), *args], text=True).strip()
+        git('init', '-q')
+        git('config', 'user.name', 'Test')
+        git('config', 'user.email', 'test@example.invalid')
+        props = self.root / 'Directory.Build.props'
+        def version(value):
+            props.write_text(f'<Project><PropertyGroup><Version>{value}</Version></PropertyGroup></Project>')
+        version('1.1.0.0')
+        git('add', '.'); git('commit', '-qm', 'initial')
+        before = git('rev-parse', 'HEAD')
+        (self.root / 'README.md').write_text('Documentation')
+        git('add', '.'); git('commit', '-qm', 'docs')
+        self.assertFalse(self.dist.version_bumped(before, self.root))
+        version('1.1.0.1')
+        self.assertTrue(self.dist.version_bumped(before, self.root))
+        version('1.0.0.0')
+        self.assertFalse(self.dist.version_bumped(before, self.root))
+
+    def test_initial_push_and_invalid_commit_ids(self):
+        (self.root / 'Directory.Build.props').write_text('<Project><PropertyGroup><Version>1.0.0.0</Version></PropertyGroup></Project>')
+        self.assertTrue(self.dist.version_bumped('0' * 40, self.root))
+        with self.assertRaises(ValueError):
+            self.dist.version_bumped('--not-a-commit', self.root)
 
     def test_catalog_points_at_immutable_version_and_actual_zip_checksum(self):
         path = self.archive()
@@ -113,6 +140,16 @@ class DistributionTests(unittest.TestCase):
         path.write_bytes(path.read_bytes() + b'changed')
         with self.assertRaisesRegex(ValueError, 'SHA-256'):
             self.dist.verify_asset(path, release)
+
+    def test_existing_release_must_match_the_tested_build(self):
+        published = self.archive()
+        tested = self.root / 'tested.zip'
+        tested.write_bytes(published.read_bytes())
+        release = {'assets': [{'name': published.name, 'digest': 'sha256:' + hashlib.sha256(published.read_bytes()).hexdigest()}]}
+        self.dist.verify_asset(published, release, tested)
+        tested.write_bytes(b'different build')
+        with self.assertRaisesRegex(ValueError, 'tested build'):
+            self.dist.verify_asset(published, release, tested)
 
     def test_missing_github_digest_is_rejected(self):
         path = self.archive()
