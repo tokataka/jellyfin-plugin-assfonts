@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><RootNamespace>Jellyfin.Plugin.AssFonts</RootNamespace></PropertyGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="Jellyfin.Controller" Version="12.4.0" ExcludeAssets="runtime" />
+    <PackageReference Include="Jellyfin.Model" Version="12.4.0" ExcludeAssets="runtime" />
+    <EmbeddedResource Include="Native/assfonts-linux-x64" LogicalName="AssFonts.Native.linux-x64" />
+    <EmbeddedResource Include="Native/assfonts-linux-arm64" LogicalName="AssFonts.Native.linux-arm64" />
+    <EmbeddedResource Include="Native/assfonts-win-x64.exe" LogicalName="AssFonts.Native.win-x64" />
+    <EmbeddedResource Include="Native/assfonts-win-arm64.exe" LogicalName="AssFonts.Native.win-arm64" />
+    <EmbeddedResource Include="Native/assfonts-osx-x64" LogicalName="AssFonts.Native.osx-x64" />
+    <EmbeddedResource Include="Native/assfonts-osx-arm64" LogicalName="AssFonts.Native.osx-arm64" />
+    <EmbeddedResource Include="Configuration/configPage.html" />
+  </ItemGroup>
+</Project>

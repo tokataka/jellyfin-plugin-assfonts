@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>ASS Fonts</title></head>
+<body>
+<div id="AssFontsConfigPage" data-role="page" class="page type-interior pluginConfigurationPage" data-require="emby-input,emby-button">
+  <div data-role="content"><div class="content-primary">
+    <form id="AssFontsConfigForm">
+      <div class="inputContainer">
+        <label class="inputLabel inputLabelUnfocused" for="AssFontsDirectory">Font directory</label>
+        <input id="AssFontsDirectory" type="text" is="emby-input" autocomplete="off" />
+        <div class="fieldDescription">Absolute path on the Jellyfin server. Searches subfolders for TTF, TTC, OTF and OTC fonts. Leave empty to disable processing.</div>
+      </div>
+      <p>Embeds subset fonts into ASS/SSA subtitles and caches the generated subtitles.</p>
+      <button is="emby-button" type="submit" class="raised button-submit block emby-button"><span>Save</span></button>
+    </form>
+  </div></div>
+  <script>
+    (function () {
+      var id = 'cb963c2d-9d76-48b1-9f90-5c0cd5b25eae';
+      var page = document.querySelector('#AssFontsConfigPage');
+      var input = page.querySelector('#AssFontsDirectory');
+      function failed() { Dashboard.hideLoadingMsg(); Dashboard.alert('Unable to load or save settings. Please try again.'); }
+      page.addEventListener('pageshow', function () {
+        Dashboard.showLoadingMsg();
+        ApiClient.getPluginConfiguration(id).then(function (config) {
+          input.value = config.FontDirectory || '';
+          Dashboard.hideLoadingMsg();
+        }).catch(failed);
+      });
+      page.querySelector('form').addEventListener('submit', function (event) {
+        event.preventDefault(); Dashboard.showLoadingMsg();
+        ApiClient.getPluginConfiguration(id).then(function (config) {
+          config.FontDirectory = input.value.trim();
+          return ApiClient.updatePluginConfiguration(id, config);
+        }).then(function (result) { Dashboard.processPluginConfigurationUpdateResult(result); }).catch(failed);
+      });
+    })();
+  </script>
+</div>
+</body>
+</html>

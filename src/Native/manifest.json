@@ -1,0 +1,48 @@
+{
+  "version": "0.7.3",
+  "release": "https://github.com/wyzdwdz/assfonts/releases/tag/v0.7.3",
+  "binaries": [
+    {
+      "runtimeId": "linux-x64",
+      "url": "https://github.com/wyzdwdz/assfonts/releases/download/v0.7.3/assfonts-v0.7.3-x86_64-Linux.tar.gz",
+      "archiveSha256": "c90e1e0f439296f41c5b9d1c434f029965ab0b9c1d02f41e33495cd9d7c45a62",
+      "executableSha256": "5e2ef6e6f819f7a989ddb64cd9090d75c64b3e5db7b13fc3bb4db5948914b17e",
+      "size": 6802408
+    },
+    {
+      "runtimeId": "win-x64",
+      "url": "https://github.com/wyzdwdz/assfonts/releases/download/v0.7.3/assfonts-v0.7.3-x86_64-Windows.zip",
+      "archiveSha256": "4dd11a3aa86cf03b8428ffd644b54c25d9a0ab7ab212c1460e6a34eaf22d7fa4",
+      "executableSha256": "c5d9e4a118924c970b1fa9a2b484181dbb29a30b4117517bb502dc67e0c181e1",
+      "size": 5966336
+    },
+    {
+      "runtimeId": "osx-x64",
+      "url": "https://github.com/wyzdwdz/assfonts/releases/download/v0.7.3/assfonts-v0.7.3-x86_64-macOS.dmg",
+      "archiveSha256": "c9b20f4d1fffa151eebaec126c75a485d86e96b7c6609507aa5ef0edf48bbac7",
+      "executableSha256": "158576e148b4dae9ab1dc8a23b06b9681cd5315c5f585940af9a978a0ea4fe88",
+      "size": 5688544
+    },
+    {
+      "runtimeId": "linux-arm64",
+      "url": "https://github.com/wyzdwdz/assfonts/releases/download/v0.7.3/assfonts-v0.7.3-aarch64-Linux.tar.gz",
+      "archiveSha256": "80d97854129a0d75ecda60533930654ed3c18a8183605a75b602f37bf23d8859",
+      "executableSha256": "fb188fecee148d337c3987c81570134403408a3f5269fb21de740e2d9e981e24",
+      "size": 6251960
+    },
+    {
+      "runtimeId": "win-arm64",
+      "url": "https://github.com/wyzdwdz/assfonts/releases/download/v0.7.3/assfonts-v0.7.3-aarch64-Windows.zip",
+      "archiveSha256": "bc15f14cd55d18dd2a2ec8a498a5cf0fbadfba518f55561e45ea9de237b38bad",
+      "executableSha256": "6a01519d45cb6b500cead3afde430229f8b63410e5197273b1574c1816eb11e3",
+      "size": 5713408
+    },
+    {
+      "runtimeId": "osx-arm64",
+      "url": "https://github.com/wyzdwdz/assfonts/releases/download/v0.7.3/assfonts-v0.7.3-aarch64-macOS.dmg",
+      "archiveSha256": "2bd36fb85055719d1d99f2dedb298e791cacaac4028ffed6f97c2d2b07093f7c",
+      "executableSha256": "9e7d1b6bfff3169e02b610430320327986102b41b46fdcb8981fb9b2bd4728d8",
+      "size": 5176616
+    }
+  ]
+}

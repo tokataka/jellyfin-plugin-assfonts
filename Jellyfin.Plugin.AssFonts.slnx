@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/Jellyfin.Plugin.AssFonts.csproj" />
+  <Project Path="tests/AssFonts.Tests.csproj" />
+</Solution>

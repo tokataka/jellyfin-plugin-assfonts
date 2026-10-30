@@ -1,0 +1,9 @@
+**/bin/
+**/obj/
+artifacts/
+nuget/
+.vs/
+.build-cache/
+__pycache__/
+*.pyc
+.superpowers/

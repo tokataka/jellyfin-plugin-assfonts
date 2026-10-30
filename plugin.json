@@ -1,0 +1,9 @@
+{
+  "guid": "cb963c2d-9d76-48b1-9f90-5c0cd5b25eae",
+  "name": "ASS Fonts",
+  "description": "Embeds subset fonts into ASS/SSA subtitles served by Jellyfin using attached fonts and a configured font directory. Generated subtitles are cached.",
+  "overview": "Subset font embedding for ASS/SSA subtitles",
+  "owner": "tokataka",
+  "category": "General",
+  "targetAbi": "12.4.0.0"
+}
